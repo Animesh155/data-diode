@@ -1,4 +1,4 @@
-# 🔒 Hardware Data Diode for Industrial Security
+# Hardware Data Diode for Industrial Security
 
 ## The Problem
 
