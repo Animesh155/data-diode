@@ -1,0 +1,145 @@
+# ==============================================================================
+# OSDD Protocol Gateway — MQTT Gateway Configuration
+# ==============================================================================
+#
+# Production configuration for an MQTT-based data acquisition gateway.
+# The driver subscribes to an MQTT broker, parses incoming messages, applies
+# filters, and forwards tag values through a one-way data-diode transport.
+#
+# Environment variables are supported:
+#   ${VAR}            — substituted; error if unset
+#   ${VAR:-default}   — substituted with fallback default
+# ==============================================================================
+
+# ── Gateway-level settings ────────────────────────────────────────────────────
+gateway:
+  name: "mqtt-gateway-01"
+  log_level: "${LOG_LEVEL:-INFO}"              # DEBUG | INFO | WARNING | ERROR
+  log_file: null                                # set to a path for file logging
+
+# ── Driver / protocol configuration ──────────────────────────────────────────
+driver:
+  name: "mqtt-gateway"
+  type: "mqtt"
+  poll_interval: 1.0          # how often to drain the internal message queue (seconds)
+
+  # ── Broker connection ────────────────────────────────────────────────────
+  broker:
+    host: "${MQTT_BROKER_HOST:-localhost}"
+    port: ${MQTT_BROKER_PORT:-1883}
+    username: "${MQTT_USER:-}"                  # leave empty for anonymous access
+    password: "${MQTT_PASS:-}"
+    tls_enabled: false                          # set true for TLS; configure certs as needed
+    client_id: "osdd-mqtt-gateway"
+    clean_session: true                         # false to resume prior subscriptions
+    keepalive_seconds: 60
+
+  # ── Subscriptions ────────────────────────────────────────────────────────
+  #
+  # Each entry maps an MQTT topic (with optional wildcards) to a tag namespace.
+  # Supported payload_format values: json, plain, csv
+  #
+  subscriptions:
+    # ── Temperature sensors (JSON payloads) ──────────────────────────────
+    #
+    # Expects messages like:
+    #   topic:   factory/temperature/zone1
+    #   payload: {"value": 23.5, "unit": "C", "ts": 1700000000}
+    #
+    - topic: "factory/temperature/+"
+      qos: 1
+      tag_prefix: "mqtt_temp"
+      payload_format: "json"
+      value_key: "value"                        # dotted path into JSON object
+      data_type: "float64"
+      unit: "°C"
+
+    # ── Humidity sensors (JSON payloads) ─────────────────────────────────
+    #
+    # Expects messages like:
+    #   topic:   factory/humidity/zone1
+    #   payload: {"value": 65.0, "unit": "%"}
+    #
+    - topic: "factory/humidity/+"
+      qos: 1
+      tag_prefix: "mqtt_humidity"
+      payload_format: "json"
+      value_key: "value"
+      data_type: "float64"
+      unit: "%"
+
+    # ── Equipment status (plain text payloads) ───────────────────────────
+    #
+    # Expects messages like:
+    #   topic:   factory/status/pump1
+    #   payload: RUNNING
+    #
+    - topic: "factory/status/#"
+      qos: 0
+      tag_prefix: "mqtt_status"
+      payload_format: "plain"
+      data_type: "string"
+
+    # ── Catch-all sensor data (JSON, nested key) ─────────────────────────
+    #
+    # Demonstrates multi-level wildcard and nested JSON key extraction.
+    #   topic:   sensors/building-a/floor-2/co2
+    #   payload: {"data": {"reading": 412.3}, "ts": 1700000000}
+    #
+    # - topic: "sensors/#"
+    #   qos: 0
+    #   tag_prefix: "mqtt_sensor"
+    #   payload_format: "json"
+    #   value_key: "data.reading"
+    #   data_type: "float64"
+
+# ── Filters ──────────────────────────────────────────────────────────────────
+filters:
+  # Range filters: drop or clamp values outside expected operating ranges
+  range:
+    - tag_pattern: "mqtt_temp.*"
+      min: -40.0
+      max: 150.0
+      action: clamp                             # clamp to [min, max]
+
+    - tag_pattern: "mqtt_humidity.*"
+      min: 0.0
+      max: 100.0
+      action: clamp
+
+  # Keyword filters: allow / deny specific tag names by regex
+  keyword:
+    - pattern: "^mqtt_.*"
+      action: allow
+
+    - pattern: "^debug_.*"
+      action: deny                              # exclude debug tags
+
+  # Deadband: suppress values that haven't changed significantly
+  deadband:
+    default_percent: 1.0                        # 1 % change-of-value deadband
+    overrides:
+      - tag_pattern: "mqtt_status.*"
+        percent: 0.0                            # always report status changes
+      - tag_pattern: "mqtt_temp.*"
+        percent: 0.5                            # finer resolution for temperature
+
+# ── Transport (to data-diode interface) ──────────────────────────────────────
+transport:
+  type: udp
+  host: "${DIODE_TX_HOST:-127.0.0.1}"
+  port: ${DIODE_TX_PORT:-5000}
+  mtu: 1472                                    # standard Ethernet MTU minus IP/UDP headers
+  redundancy: 3                                 # send each packet 3× for reliability
+  encoding: msgpack                             # compact binary serialisation
+
+# ── Health / Metrics endpoint ────────────────────────────────────────────────
+health:
+  enabled: true
+  host: "0.0.0.0"
+  port: ${HEALTH_PORT:-9092}
+
+  # Endpoints exposed:
+  #   GET /health   — JSON: overall status, uptime, driver states, tag stats
+  #   GET /metrics  — Prometheus text exposition format
+  #   GET /tags     — JSON dump of all current tag values (debug)

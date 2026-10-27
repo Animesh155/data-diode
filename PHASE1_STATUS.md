@@ -180,10 +180,12 @@ docker compose down -v   # -v removes named volumes
 
 | Decision | Choice | Why |
 |----------|--------|-----|
-| Wire format | 24-byte custom binary | Smallest useful frame, easy CRC |
-| Redundancy | 3 copies + interleave | At our error rates, copies > FEC |
+| Wire format | v2 batch: all readings from one poll in one datagram | Amortizes header+CRC over every reading; fewer packets = less loss |
+| Loss recovery | Keyframe refresh + send-on-change | No back-channel needed; a lost delta self-heals at the next full refresh |
+| Redundancy | Heartbeat frame only (duplicated) | Bulk data relies on refresh; only the tiny can't-miss frame is copied |
+| Integrity | CRC-32 (no in-frame FEC on live path) | On this UDP link loss dominates corruption; RS retained as FPGA reference only |
 | Protocol break | Adapter pattern | FPGA stays protocol-agnostic |
-| Frame size | Fixed 24 bytes | Simpler than variable for now |
+| Frame size | Variable batch (14B header + 7B/record + 4B CRC) | One poll = one datagram |
 | Transport | UDP | Matches one-way nature (no ACKs) |
 | Heartbeat | Same frame, tag 0xFFFF | No format change needed |
 | Reorder tolerance | 500ms window | > 3× our 150ms copy spacing |
@@ -217,7 +219,7 @@ docker compose down -v   # -v removes named volumes
 |-----------|--------------|
 | OPC UA adapter | Kepware does this in production deployments |
 | MQTT adapter | Lower priority than diode-specific features |
-| Reed-Solomon FEC | Replication is sufficient at our error rates |
+| In-frame Reed-Solomon FEC (live path) | Wrong tool here — intra-frame RS fixes byte corruption, not the packet loss that dominates a UDP diode link. Kept in frame.py as the bit-accurate FPGA reference model for the eventual raw-optical PHY. |
 | ML anomaly detection | Phase 2 work |
 | Verilog port | Phase 3+ (real hardware path) |
 | SWaT integration | Designed but not implemented |

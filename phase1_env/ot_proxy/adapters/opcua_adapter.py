@@ -14,6 +14,7 @@ Tag-id namespace: 0x0301-0x030F (see s7_adapter for the full map).
 import logging
 import time
 
+from asyncua import ua
 from asyncua.sync import Client
 
 
@@ -55,11 +56,20 @@ class OpcUaAdapter:
             client = Client(url=self.url)
             client.connect()
             ns_idx = client.get_namespace_index(NAMESPACE_URI)
-            container = client.nodes.objects.get_child([f"{ns_idx}:ProcessVariables"])
+            # Resolve each tag by its string NodeId (ns=<idx>;s=<name>) rather
+            # than by walking browse paths. The NodeId is the stable handle a
+            # real server publishes for a tag — Kepware/PLC4X hand out exactly
+            # this form (e.g. ns=2;s=Channel1.Device1.Tag). Browse names depend
+            # on how the address space happened to be built and can sit in a
+            # different namespace than the NodeId, which is fragile to rely on.
             nodes = []
             for tag_id, name in OPCUA_TAG_MAP:
-                node = container.get_child([f"{ns_idx}:{name}"])
+                node = client.get_node(ua.NodeId(name, ns_idx))
                 nodes.append((tag_id, name, node))
+            # get_node() is purely local — it builds a handle without touching
+            # the wire. Probe one read so a wrong namespace or missing tag
+            # fails here at connect time instead of silently on every poll.
+            nodes[0][2].read_value()
             self.client = client
             self.nodes = nodes
             self.log.info(f"Connected to OPC UA server at {self.url} (ns={ns_idx})")

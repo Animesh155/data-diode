@@ -80,8 +80,9 @@ services:
       - FPGA_HOST=fpga-sim
       - FPGA_PORT=5000
       - POLL_INTERVAL=1.0
-      - NUM_COPIES=1               # Reed-Solomon FEC replaces 3-copy redundancy
-      - INTERLEAVE_DEPTH=3
+      - KEYFRAME_INTERVAL=5.0      # full tag-table refresh every 5s (loss recovery)
+      - CHANGE_DEADBAND=0.0        # 0.0 = send on any change; raise (e.g. 0.01) to compress
+      - HEARTBEAT_COPIES=3         # duplicate the tiny heartbeat frame only
     networks:
       - ot-net        # can reach plc-modbus
       - diode-net     # can reach fpga-sim
@@ -103,7 +104,7 @@ services:
       - IT_PROXY_HOST=it-proxy
       - IT_PROXY_PORT=6000
       - FIFO_DEPTH=64
-      - CORRUPT_RATE=0.0
+      - CORRUPT_RATE=${CORRUPT_RATE:-0.0}
     networks:
       - diode-net     # receives from ot-proxy
       - it-net        # sends to it-proxy

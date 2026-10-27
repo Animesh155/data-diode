@@ -4,12 +4,12 @@ it_proxy.py — IT-Side Proxy (with reorder tolerance)
 The receiver on the corporate/cloud side of the data diode.
 
 What this does:
-  1. RECEIVE:     UDP frames from the FPGA
-  2. CRC CHECK:   Verify frame integrity (defense in depth — FPGA already checked)
-  3. DEDUPLICATE: Same SEQ received multiple times? Keep first, drop copies.
+  1. RECEIVE:     UDP batch datagrams from the FPGA (one per OT poll cycle)
+  2. CRC CHECK:   Verify batch integrity (defense in depth — FPGA already checked)
+  3. DEDUPLICATE: Same batch SEQ seen again? Keep first, drop copies.
   4. GAP DETECT:  SEQ jumped? Defer the report — wait to see if it arrives late.
-  5. DECODE:      Unpack the 11-byte struct into human-readable values
-  6. DELIVER:     Print to console (in production: MQTT, InfluxDB, SIEM)
+  5. EXPLODE:     Unpack every record in the batch (shared timestamp per batch)
+  6. DELIVER:     Console + InfluxDB (heartbeat records feed the monitor)
 
 REORDER TOLERANCE:
   UDP doesn't guarantee in-order delivery. Under load, frames arrive
@@ -29,7 +29,7 @@ import logging
 from datetime import datetime
 
 sys.path.insert(0, '/app')
-from frame import parse_frame, unpack_sensor_struct, SENSOR_STRUCT_SIZE
+from frame import parse_batch
 
 # InfluxDB client — best-effort; if missing or InfluxDB is down, IT proxy
 # still works normally (we just skip metrics writes).
@@ -56,8 +56,9 @@ REORDER_TOLERANCE = float(os.environ.get('REORDER_TOLERANCE', '0.5'))
 HEARTBEAT_TAG_ID = 0xFFFF
 
 # Seconds of silence before we declare the OT side dead.
-# OT proxy sends heartbeat every 1s. With 3-copy redundancy, P(all 3 lost)
-# is tiny. So 5s = 5 missed heartbeats is well past coincidence.
+# OT proxy sends a heartbeat frame every poll, duplicated HEARTBEAT_COPIES
+# times, so P(all copies of several consecutive heartbeats lost) is tiny.
+# 5s = ~5 missed heartbeats is well past coincidence.
 HEARTBEAT_TIMEOUT = float(os.environ.get('HEARTBEAT_TIMEOUT', '5.0'))
 
 # ── Dashboard / InfluxDB config ──────────────────────────────
@@ -116,16 +117,23 @@ class FrameReceiver:
 
         # Stats
         self.total_received = 0
+        self.total_unique = 0            # monotonic — unlike len(seen), which
+                                         # is pruned to the dedup window and
+                                         # must NOT be used as a rate denominator
         self.total_duplicates = 0
         self.confirmed_gaps = 0          # truly lost (after tolerance window)
         self.confirmed_lost_frames = 0
         self.reordered_recovered = 0     # arrived late, gap was false alarm
-        self.rs_corrected_frames = 0     # frames recovered by Reed-Solomon FEC
-        self.rs_corrected_bytes = 0      # total bytes Reed-Solomon repaired
+        # Retained for dashboard/InfluxDB schema compatibility. The live path
+        # is CRC-only (no in-frame FEC), so these stay 0 unless an RS reference
+        # path is ever re-enabled. See frame.py.
+        self.rs_corrected_frames = 0
+        self.rs_corrected_bytes = 0
 
-    def process(self, seq: int, ttl: int) -> str:
+    def process(self, seq: int) -> str:
         """
-        Returns: 'new', 'duplicate', 'reordered', or 'suspicious'
+        Returns: 'new', 'duplicate', 'reordered', or 'suspicious'.
+        Operates on the batch sequence number (one per datagram sent).
         """
         self.total_received += 1
 
@@ -133,6 +141,7 @@ class FrameReceiver:
         if self.expected_next is None:
             self.expected_next = seq + 1
             self.seen.add(seq)
+            self.total_unique += 1
             return 'new'
 
         # Check: is this a late arrival of a pending-gap SEQ?
@@ -142,6 +151,7 @@ class FrameReceiver:
                 gap['missing'].discard(seq)
                 self.reordered_recovered += 1
                 self.seen.add(seq)
+                self.total_unique += 1
                 return 'reordered'
 
         # Duplicate detection
@@ -160,6 +170,7 @@ class FrameReceiver:
                 self.expected_next = seq + 1
                 self.seen.clear()
                 self.seen.add(seq)
+                self.total_unique += 1
                 self.pending_gaps.clear()
                 return 'suspicious'
 
@@ -173,6 +184,7 @@ class FrameReceiver:
 
         # Accept this frame
         self.seen.add(seq)
+        self.total_unique += 1
         if seq >= self.expected_next:
             self.expected_next = seq + 1
 
@@ -279,7 +291,7 @@ class MetricsPublisher:
 
             p = (Point("diode_stats")
                  .field("received",          receiver.total_received)
-                 .field("unique",            len(receiver.seen))
+                 .field("unique",            receiver.total_unique)
                  .field("duplicates",        receiver.total_duplicates)
                  .field("reordered",         receiver.reordered_recovered)
                  .field("confirmed_lost",    receiver.confirmed_lost_frames)
@@ -447,69 +459,26 @@ def main():
         receiver.expire_pending_gaps()
         heartbeat.check_timeout()
 
-        # ── CRC + RS Check (defense in depth) ────────────────
-        # parse_frame() validates CRC first, then attempts RS recovery
-        # if CRC fails. Returns None if both fail (uncorrectable).
-        parsed = parse_frame(data)
+        # ── Validate (CRC) ───────────────────────────────────
+        # parse_batch() checks SYNC + version + CRC-32. A corrupt or
+        # malformed datagram returns None and is dropped. There is no
+        # in-frame error correction on the live path — loss recovery is
+        # the OT proxy's keyframe refresh, not retransmission or FEC.
+        parsed = parse_batch(data)
         if parsed is None:
-            print(f"[DROP] Bad CRC + RS uncorrectable ({len(data)} bytes)")
+            print(f"[DROP] Bad CRC / malformed ({len(data)} bytes)")
             continue
 
-        # Track Reed-Solomon corrections (forward error correction stats)
-        if parsed.get('rs_corrected', 0) > 0:
-            receiver.rs_corrected_frames += 1
-            receiver.rs_corrected_bytes += parsed['rs_corrected']
-            print(f"[RS-FIX] seq={parsed['seq']:>6d} | "
-                  f"fixed {parsed['rs_corrected']} byte error(s)")
-
-        seq = parsed['seq']
-        ttl = parsed['ttl']
-
-        # ── Process (dedup / reorder / gap detection) ────────
-        result = receiver.process(seq, ttl)
-
+        # ── Dedup / reorder / gap detection on batch SEQ ─────
+        result = receiver.process(parsed['seq'])
         if result == 'duplicate':
-            continue
-        if result == 'reordered':
-            # Late arrival — log distinctly so we can see reordering happening
-            if parsed['payload_len'] == SENSOR_STRUCT_SIZE:
-                reading = unpack_sensor_struct(parsed['payload'])
-                tag_name = TAG_NAMES.get(reading['tag_id'], f"tag_{reading['tag_id']}")
-                print(f"[REORDER] seq={seq:>6d} | {tag_name} arrived late "
-                      f"(was pending gap) | TTL{ttl}")
+            # e.g. a redundant heartbeat copy — already delivered
             continue
 
-        # ── Decode payload ────────────────────────────────────
-        if parsed['payload_len'] == SENSOR_STRUCT_SIZE:
-            reading = unpack_sensor_struct(parsed['payload'])
-
-            # HEARTBEAT INTERCEPT: not a sensor reading
-            if reading['tag_id'] == HEARTBEAT_TAG_ID:
-                heartbeat.on_heartbeat(
-                    value=reading['value'],
-                    quality=reading['quality'],
-                )
-                # Don't print as DATA — heartbeat logs itself on state changes
-                # (skip periodic stats check too — heartbeat is internal)
-                continue
-
-            tag_name = TAG_NAMES.get(reading['tag_id'], f"tag_{reading['tag_id']}")
-            ts_str = datetime.utcfromtimestamp(reading['timestamp']).strftime('%H:%M:%S')
-            quality = 'GOOD' if reading['quality'] == 0 else f"q={reading['quality']}"
-
-            # Push to InfluxDB (best-effort, never blocks)
-            metrics.write_sensor(
-                tag_id=reading['tag_id'],
-                tag_name=tag_name,
-                value=reading['value'],
-                quality=reading['quality'],
-                ttl=ttl,
-            )
-
-            print(f"[DATA] seq={seq:>6d} | {ts_str} | {tag_name:<25s} = "
-                  f"{reading['value']:>10.2f} | {quality} | TTL{ttl}")
-        else:
-            print(f"[DATA] seq={seq:>6d} | unknown payload ({parsed['payload_len']} bytes)")
+        # 'reordered' arrived late (was a pending gap); 'new'/'suspicious'
+        # are fresh. All carry real, CRC-valid data → deliver every record.
+        _deliver_batch(parsed, late=(result == 'reordered'),
+                       heartbeat=heartbeat, metrics=metrics)
 
         # Periodic stats
         now = time.time()
@@ -519,19 +488,56 @@ def main():
             last_stats_time = now
 
 
+def _deliver_batch(parsed, late, heartbeat, metrics):
+    """
+    Explode a validated batch into its records and deliver each one:
+    heartbeat records update the HeartbeatMonitor; sensor records go to
+    InfluxDB + console. All records share the batch's timestamp.
+    """
+    ts_str = datetime.utcfromtimestamp(parsed['timestamp']).strftime('%H:%M:%S')
+    seq = parsed['seq']
+    kind = 'KEYFRAME' if parsed['keyframe'] else 'delta'
+    prefix = '[LATE]' if late else '[DATA]'
+
+    for rec in parsed['records']:
+        tag_id = rec['tag_id']
+        value = rec['value']
+        quality = rec['quality']
+
+        # HEARTBEAT INTERCEPT — not a sensor reading.
+        if tag_id == HEARTBEAT_TAG_ID:
+            heartbeat.on_heartbeat(value=value, quality=quality)
+            continue
+
+        tag_name = TAG_NAMES.get(tag_id, f"tag_{tag_id}")
+        quality_str = 'GOOD' if quality == 0 else f"q={quality}"
+
+        # Push to InfluxDB (best-effort, never blocks). ttl has no meaning
+        # in the batch format (no per-frame copy number) — pass 0.
+        metrics.write_sensor(
+            tag_id=tag_id, tag_name=tag_name, value=value,
+            quality=quality, ttl=0,
+        )
+
+        print(f"{prefix} seq={seq:>6d} | {ts_str} | {kind:<8s} | "
+              f"{tag_name:<25s} = {value:>10.2f} | {quality_str}")
+
+
 def _print_stats(receiver, heartbeat):
     """Print stats with reorder-aware metrics + heartbeat status + RS recoveries."""
     pending = sum(len(g['missing']) for g in receiver.pending_gaps)
     print(f"[STATS] received={receiver.total_received} "
-          f"unique={len(receiver.seen)} "
+          f"unique={receiver.total_unique} "
           f"duplicates={receiver.total_duplicates} "
           f"reordered={receiver.reordered_recovered} "
           f"confirmed_lost={receiver.confirmed_lost_frames} "
           f"rs_fixed={receiver.rs_corrected_frames} "
           f"pending={pending}")
 
-    # Loss rate uses CONFIRMED losses only
-    total_processed = (len(receiver.seen) +
+    # Loss rate uses CONFIRMED losses only. Denominator is the monotonic
+    # unique counter — len(seen) is pruned to the dedup window and would
+    # overstate the rate ~300x once the window fills.
+    total_processed = (receiver.total_unique +
                        receiver.confirmed_lost_frames)
     if total_processed > 0:
         loss_pct = (receiver.confirmed_lost_frames / total_processed) * 100

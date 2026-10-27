@@ -1,0 +1,220 @@
+# ==============================================================================
+# OSDD Protocol Gateway — Modbus TCP Gateway Configuration
+# ==============================================================================
+#
+# Production-ready configuration for polling two simulated Modbus TCP devices
+# via localhost.  Demonstrates multiple tag types, data types, scaling,
+# filtering, UDP transport, and the health/metrics endpoint.
+#
+# Run the simulators first:
+#   python -m tests.simulators.modbus_sim --port 5020
+#   python -m tests.simulators.modbus_sim --port 5021
+#
+# Environment variable overrides:
+#   ${VAR}            — substituted; error if unset
+#   ${VAR:-default}   — substituted with fallback
+# ==============================================================================
+
+# ── Gateway-level settings ────────────────────────────────────────────────────
+gateway:
+  name: "modbus-lab-gateway"
+  log_level: "${LOG_LEVEL:-INFO}"               # DEBUG | INFO | WARNING | ERROR
+  log_file: null                                 # e.g. "/var/log/osdd/gateway.log"
+
+# ── Driver / protocol configuration ──────────────────────────────────────────
+driver:
+  name: "modbus-gateway"
+  type: "modbus"
+  protocol: modbus
+  poll_interval: 1.0            # global default poll interval (seconds)
+  timeout: 5.0                  # TCP connect / read timeout
+  retry_max_attempts: 0         # 0 = retry forever with exponential backoff
+
+  devices:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Device 1: Primary process controller (simulator on port 5020)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: "plc-primary"
+      host: "127.0.0.1"
+      port: 5020
+      unit_id: 1
+      timeout_seconds: 3
+      poll_interval: 0.5        # faster poll for critical process data
+
+      tags:
+        # ── Float32: Temperature sensor (2 holding registers) ──────────────
+        - name: "reactor_temperature"
+          register_type: "holding_registers"
+          address: 0
+          data_type: "float32"
+          byte_order: "big_endian"
+          word_swap: false
+          scale: 1.0             # raw value is already in °C
+          offset: 0.0
+          unit: "°C"
+
+        # ── Float32: Pressure transducer (2 holding registers) ─────────────
+        - name: "reactor_pressure"
+          register_type: "holding_registers"
+          address: 2
+          data_type: "float32"
+          byte_order: "big_endian"
+          word_swap: false
+          scale: 1.0
+          offset: 0.0
+          unit: "bar"
+
+        # ── uint16: Flow rate with scaling (1 holding register) ────────────
+        - name: "coolant_flow"
+          register_type: "holding_registers"
+          address: 4
+          data_type: "uint16"
+          byte_order: "big_endian"
+          scale: 0.01            # raw 1500 → 15.00 L/min
+          offset: 0.0
+          unit: "L/min"
+
+        # ── uint32: Packet counter (2 holding registers) ───────────────────
+        - name: "total_packets"
+          register_type: "holding_registers"
+          address: 5
+          data_type: "uint32"
+          byte_order: "big_endian"
+          word_swap: false
+          scale: 1.0
+          offset: 0.0
+          unit: "count"
+
+        # ── int16: Signed offset value (1 holding register) ────────────────
+        - name: "calibration_offset"
+          register_type: "holding_registers"
+          address: 7
+          data_type: "int16"
+          byte_order: "big_endian"
+          scale: 0.1             # raw -200 → -20.0
+          offset: 0.0
+          unit: "mV"
+
+        # ── Bool: Emergency stop coil ──────────────────────────────────────
+        - name: "emergency_stop"
+          register_type: "coils"
+          address: 0
+          data_type: "bool"
+
+        # ── Bool: Pump running coil ────────────────────────────────────────
+        - name: "pump_running"
+          register_type: "coils"
+          address: 1
+          data_type: "bool"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Device 2: Auxiliary environmental monitor (simulator on port 5021)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: "plc-auxiliary"
+      host: "127.0.0.1"
+      port: 5021
+      unit_id: 2
+      timeout_seconds: 3
+      poll_interval: 2.0        # environmental data — slower poll is fine
+
+      tags:
+        # ── uint16: Ambient temperature from input register ────────────────
+        - name: "ambient_temperature"
+          register_type: "input_registers"
+          address: 0
+          data_type: "uint16"
+          byte_order: "big_endian"
+          scale: 0.1             # raw 250 → 25.0 °C
+          offset: -40.0          # sensor has -40 offset
+          unit: "°C"
+
+        # ── uint16: Humidity from input register ───────────────────────────
+        - name: "humidity"
+          register_type: "input_registers"
+          address: 1
+          data_type: "uint16"
+          byte_order: "big_endian"
+          scale: 0.1
+          offset: 0.0
+          unit: "%RH"
+
+        # ── uint16: Supply voltage ─────────────────────────────────────────
+        - name: "supply_voltage"
+          register_type: "input_registers"
+          address: 2
+          data_type: "uint16"
+          byte_order: "big_endian"
+          scale: 0.001           # raw 24000 → 24.000 V
+          offset: 0.0
+          unit: "V"
+
+        # ── Bool: Door open sensor (discrete input) ────────────────────────
+        - name: "cabinet_door_open"
+          register_type: "discrete_inputs"
+          address: 0
+          data_type: "bool"
+
+# ── Filters ──────────────────────────────────────────────────────────────────
+#
+# Filters are applied in order before tags are forwarded to the transport.
+# Supported filter types: range, keyword, deadband.
+filters:
+  # Range filters: drop or clamp values outside expected operating limits
+  range:
+    - tag_pattern: "reactor_temperature"
+      min: -50.0
+      max: 500.0
+      action: clamp              # clamp extreme readings to [min, max]
+
+    - tag_pattern: "reactor_pressure"
+      min: 0.0
+      max: 30.0
+      action: drop               # discard impossible pressure readings
+
+    - tag_pattern: "coolant_flow"
+      min: 0.0
+      max: 100.0
+      action: flag               # keep value but mark quality as "Uncertain"
+
+  # Keyword filters: allow or deny tags by regex pattern
+  keyword:
+    - pattern: "^reactor_.*"
+      action: allow
+
+    - pattern: "^ambient_.*"
+      action: allow
+
+    - pattern: "^debug_.*"
+      action: deny
+
+  # Deadband: suppress values that haven't changed by more than N%
+  deadband:
+    default_percent: 1.0          # 1% change-of-value threshold
+    overrides:
+      - tag_pattern: "emergency_stop"
+        percent: 0.0              # always report boolean state changes
+      - tag_pattern: "reactor_temperature"
+        percent: 0.5              # tighter deadband for critical temperature
+
+# ── Transport (to data-diode interface) ──────────────────────────────────────
+#
+# Tags passing all filters are serialised and sent over the unidirectional
+# data-diode link.
+transport:
+  type: udp
+  host: "127.0.0.1"              # localhost for testing
+  port: 5000
+  mtu: 1472                      # standard Ethernet MTU minus IP+UDP headers
+  redundancy: 3                  # send each packet 3× for reliability
+  encoding: msgpack              # compact binary serialisation
+
+# ── Health / Metrics endpoint ────────────────────────────────────────────────
+#
+# Exposes HTTP endpoints for monitoring:
+#   GET /health   — JSON: gateway status, driver states, tag stats
+#   GET /metrics  — Prometheus text exposition format
+#   GET /tags     — JSON dump of all current tag values (debug)
+health:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9091                     # different from default to avoid port clash

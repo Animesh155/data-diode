@@ -4,7 +4,7 @@ fpga_sim.py — FPGA Simulator
 Simulates what the real FPGA hardware does:
   1. Receive bytes on INPUT port  (from OT proxy via diode-net)
   2. Find SYNC word (0xAA55)
-  3. Read frame length
+  3. Read COUNT to compute the (variable) batch length
   4. Verify CRC-32
   5. If CRC good → push frame out OUTPUT port (to IT proxy via it-net)
   6. If CRC bad  → drop silently (no error response — there IS no response path)
@@ -15,8 +15,10 @@ What this does NOT do (just like real FPGA):
   - No sending back to the OT side — EVER
   - No TCP — only UDP (no handshake = no back-channel)
 
-The simulation also optionally CORRUPTS random frames to test the
-redundancy/interleaving system.
+The simulation also optionally CORRUPTS random frames to exercise the
+CRC-reject path (a corrupt frame fails CRC and is dropped — there is no
+in-frame error correction; loss recovery lives in the OT proxy's keyframe
+refresh).
 """
 
 import socket
@@ -30,7 +32,7 @@ from collections import deque
 # We need the frame parser — copy it or share it
 # In Docker, we'll mount frame.py into this container too
 sys.path.insert(0, '/app')
-from frame import parse_frame, SYNC_WORD, HEADER_SIZE, CRC_SIZE
+from frame import parse_batch, SYNC_WORD
 
 # ── Configuration ─────────────────────────────────────────────
 LISTEN_HOST    = '0.0.0.0'
@@ -154,9 +156,11 @@ def main():
 
         # ── CRC CHECK (this is what FPGA does in hardware) ────
         # The FPGA doesn't "parse" the frame in a software sense.
-        # It finds SYNC, reads LEN, computes CRC over the right bytes,
-        # and compares. That's ~50 lines of Verilog.
-        parsed = parse_frame(data)
+        # It finds SYNC, reads COUNT to compute the frame length, computes
+        # CRC-32 over the right bytes, and compares. It never inspects the
+        # records — it's protocol-agnostic. That's ~50 lines of Verilog.
+        # Any corruption fails CRC and is dropped (no error correction here).
+        parsed = parse_batch(data)
 
         if parsed is None:
             # CRC failed or malformed — drop silently

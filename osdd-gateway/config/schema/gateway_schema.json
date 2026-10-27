@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://osdd-gateway.local/schemas/gateway_schema.json",
+  "title": "OSDD Protocol Gateway Configuration",
+  "description": "Schema for validating the OSDD Protocol Gateway YAML configuration file.",
+  "type": "object",
+  "required": ["gateway", "driver", "transport"],
+  "additionalProperties": false,
+  "properties": {
+    "gateway": {
+      "type": "object",
+      "description": "Top-level gateway settings.",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Human-readable gateway instance name.",
+          "minLength": 1
+        },
+        "log_level": {
+          "type": "string",
+          "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+          "default": "INFO"
+        },
+        "log_file": {
+          "type": ["string", "null"],
+          "description": "Optional log file path."
+        }
+      }
+    },
+    "driver": {
+      "type": "object",
+      "description": "Protocol driver configuration.",
+      "required": ["protocol"],
+      "properties": {
+        "protocol": {
+          "type": "string",
+          "enum": ["modbus", "mqtt", "opcua"],
+          "description": "Protocol to use for data acquisition."
+        },
+        "poll_interval": {
+          "type": "number",
+          "minimum": 0.1,
+          "default": 1.0,
+          "description": "Default polling interval in seconds."
+        },
+        "timeout": {
+          "type": "number",
+          "minimum": 0.1,
+          "default": 5.0,
+          "description": "Connection / read timeout in seconds."
+        },
+        "retry_max_attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Maximum reconnection attempts (0 = infinite)."
+        },
+        "devices": {
+          "type": "array",
+          "description": "List of devices to poll.",
+          "items": {
+            "type": "object",
+            "required": ["name", "host"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Unique device identifier."
+              },
+              "host": {
+                "type": "string",
+                "description": "Hostname or IP address of the device."
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "description": "TCP/UDP port number."
+              },
+              "unit_id": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255,
+                "description": "Modbus unit / slave ID."
+              },
+              "poll_interval": {
+                "type": "number",
+                "minimum": 0.1,
+                "description": "Per-device poll interval override."
+              },
+              "tags": {
+                "type": "array",
+                "description": "Tags / registers to read from this device.",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "address"],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "address": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Register / memory address."
+                    },
+                    "count": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "default": 1,
+                      "description": "Number of registers to read."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": ["holding", "input", "coil", "discrete"],
+                      "default": "holding"
+                    },
+                    "data_type": {
+                      "type": "string",
+                      "enum": ["int16", "uint16", "int32", "uint32", "float32", "float64", "bool"],
+                      "default": "uint16"
+                    },
+                    "scale": {
+                      "type": "number",
+                      "default": 1.0,
+                      "description": "Scaling multiplier applied after read."
+                    },
+                    "offset": {
+                      "type": "number",
+                      "default": 0.0,
+                      "description": "Offset added after scaling."
+                    },
+                    "unit": {
+                      "type": "string",
+                      "description": "Engineering unit label (e.g. °C, bar)."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "description": "Tag filtering configuration.",
+      "properties": {
+        "range": {
+          "type": "array",
+          "description": "Range-based value filters.",
+          "items": {
+            "type": "object",
+            "required": ["tag_pattern"],
+            "properties": {
+              "tag_pattern": {
+                "type": "string",
+                "description": "Regex or glob pattern matching tag names."
+              },
+              "min": {
+                "type": "number",
+                "description": "Minimum acceptable value."
+              },
+              "max": {
+                "type": "number",
+                "description": "Maximum acceptable value."
+              },
+              "action": {
+                "type": "string",
+                "enum": ["drop", "clamp", "flag"],
+                "default": "drop",
+                "description": "Action when value falls outside range."
+              }
+            }
+          }
+        },
+        "keyword": {
+          "type": "array",
+          "description": "Keyword / tag-name filters.",
+          "items": {
+            "type": "object",
+            "required": ["pattern"],
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "Regex pattern for tag name matching."
+              },
+              "action": {
+                "type": "string",
+                "enum": ["allow", "deny"],
+                "default": "allow"
+              }
+            }
+          }
+        },
+        "deadband": {
+          "type": "object",
+          "description": "Change-of-value deadband settings.",
+          "properties": {
+            "default_percent": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 1.0,
+              "description": "Default deadband as a percentage of span."
+            },
+            "overrides": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["tag_pattern", "percent"],
+                "properties": {
+                  "tag_pattern": { "type": "string" },
+                  "percent": { "type": "number", "minimum": 0, "maximum": 100 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "description": "Outbound transport configuration (data-diode side).",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["udp"],
+          "description": "Transport protocol (currently only UDP)."
+        },
+        "host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Destination IP address."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 5000,
+          "description": "Destination UDP port."
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 68,
+          "maximum": 65535,
+          "default": 1472,
+          "description": "Maximum transmission unit in bytes."
+        },
+        "redundancy": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3,
+          "description": "Number of duplicate packets to send."
+        },
+        "encoding": {
+          "type": "string",
+          "enum": ["msgpack", "json", "cbor"],
+          "default": "msgpack",
+          "description": "Serialisation format for tag payloads."
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "description": "Health-check HTTP server settings.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "host": {
+          "type": "string",
+          "default": "0.0.0.0"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 9090
+        }
+      }
+    }
+  }
+}

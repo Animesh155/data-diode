@@ -102,9 +102,12 @@ async def main():
         # OPC UA in this lab is human-readable browse paths, so the
         # server explicitly hands out string identifiers rather than
         # auto-assigned numeric ones.
+        # Browse name must be qualified with the same namespace as the NodeId.
+        # A bare string here would default to ns=0, leaving the tag findable by
+        # NodeId but NOT by the ns=2 browse path the lab exercises use.
         node = await container.add_variable(
             ua.NodeId(name, idx),
-            name,
+            ua.QualifiedName(name, idx),
             0.0,
             ua.VariantType.Double,
         )

@@ -1,0 +1,67 @@
+# OSDD Modbus Gateway Configuration
+# =================================
+
+gateway:
+  name: "modbus-test-gw"
+  log_level: "DEBUG"
+
+# ---------------------------------------------------------
+# Driver Configuration (Modbus TCP)
+# ---------------------------------------------------------
+driver:
+  name: "modbus-main"
+  type: "modbus"
+  poll_interval: 1.0
+  devices:
+    - name: "sim-plc-1"
+      host: "127.0.0.1"
+      port: 5020
+      unit_id: 1
+      timeout_seconds: 3.0
+      tags:
+        # Float32 uses 2 Modbus registers
+        - name: "temperature_zone1"
+          register_type: "holding_registers"
+          address: 0
+          data_type: "float32"
+          byte_order: "big_endian"
+          unit: "°C"
+        
+        - name: "temperature_zone2"
+          register_type: "holding_registers"
+          address: 2
+          data_type: "float32"
+          byte_order: "big_endian"
+          unit: "°C"
+        
+        # Coils are single-bit booleans
+        - name: "pump_status"
+          register_type: "coils"
+          address: 0
+          data_type: "bool"
+
+# ---------------------------------------------------------
+# Filter Chain (Security & Validation)
+# ---------------------------------------------------------
+filters:
+  - type: "range"
+    rules:
+      - tag_pattern: "temperature_*"
+        min: -50.0
+        max: 150.0
+
+# ---------------------------------------------------------
+# Transport Configuration (UDP to Data Diode)
+# ---------------------------------------------------------
+transport:
+  target_host: "127.0.0.1"
+  target_port: 5000
+  batch_interval_ms: 100
+  max_packet_size: 1400
+
+# ---------------------------------------------------------
+# Health Monitoring
+# ---------------------------------------------------------
+health:
+  enabled: true
+  port: 9091

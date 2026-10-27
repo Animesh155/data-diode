@@ -1,41 +1,42 @@
 """
-ot_proxy.py — OT-Side Proxy (multi-adapter version)
+ot_proxy.py — OT-Side Proxy (batched, keyframe-refresh version)
 
 The bridge between the industrial world and the data diode.
 
 What this does:
-  1. POLL:        Fetches sensor data via PLUGGABLE ADAPTERS (Modbus, S7, OPC UA)
-  2. NORMALIZE:   Adapters convert protocol-specific responses into universal struct
-  3. FRAME:       Wraps in wire format with SYNC, SEQ, CRC
-  4. COPY:        Generates 3 copies (TTL = 3, 2, 1)
-  5. INTERLEAVE:  Spreads copies apart so one burst can't kill all copies
-  6. SEND:        UDP datagrams to the FPGA (one-way, no response expected)
+  1. POLL:       Fetch sensor data via PLUGGABLE ADAPTERS (Modbus, S7, OPC UA)
+  2. NORMALIZE:  Adapters convert protocol-specific responses to universal readings
+  3. SELECT:     Send-on-change — only readings that moved past the deadband,
+                 EXCEPT every KEYFRAME_INTERVAL seconds we send the full tag
+                 table (a "keyframe"). A lost packet self-heals at the next
+                 keyframe, so no back-channel / retransmission is needed.
+  4. BATCH:      Pack all selected readings for the poll into ONE datagram
+                 (shared timestamp + CRC amortized over every reading).
+  5. SEND:       One UDP datagram per poll to the FPGA (one-way, no response).
+  6. HEARTBEAT:  A tiny separate frame sent EVERY cycle, duplicated
+                 HEARTBEAT_COPIES times (it's the one can't-miss signal, and
+                 3× of a ~21-byte frame is negligible bandwidth).
 
-Adapter selection:
-  Set ADAPTER environment variable:
-    ADAPTER=modbus   → Modbus TCP adapter (plc-modbus:502)
-    ADAPTER=s7       → Siemens S7comm adapter (plc-s7:102)
-    ADAPTER=opcua    → OPC UA adapter (opc.tcp://plc-opcua:4840/lab/)
-    ADAPTER=http     → legacy Node-RED HTTP/JSON path (kept for compatibility)
+Loss recovery is application-layer (keyframe refresh), not an in-frame
+error-correcting code — see frame.py for why. Integrity is CRC-32.
+
+Adapter selection: set the ADAPTER environment variable
+    ADAPTER=modbus | s7 | opcua | http
 """
 
 import time
 import socket
 import urllib.request
 import json
-import collections
 import os
-import struct
 from frame import (
-    pack_sensor_struct, build_frame,
-    QUALITY_GOOD, QUALITY_COMM_FAIL
+    build_batch, MAX_RECORDS_PER_DATAGRAM,
+    QUALITY_GOOD, QUALITY_COMM_FAIL,
 )
 
 # ── Heartbeat constants ───────────────────────────────────────
 # Reserved tag_id for "I'm alive" frames. The IT proxy treats any
-# frame with this tag as a heartbeat (not a sensor reading).
-# 0xFFFF is the top of uint16 space — well clear of real sensor tags
-# (which use 0x0001-0x010F today).
+# record with this tag as a heartbeat (not a sensor reading).
 HEARTBEAT_TAG_ID = 0xFFFF
 
 # ── Configuration ─────────────────────────────────────────────
@@ -43,8 +44,18 @@ ADAPTER_TYPE      = os.environ.get('ADAPTER', 'modbus').lower()
 FPGA_HOST         = os.environ.get('FPGA_HOST', 'fpga-sim')
 FPGA_PORT         = int(os.environ.get('FPGA_PORT', '5000'))
 POLL_INTERVAL     = float(os.environ.get('POLL_INTERVAL', '1.0'))
-NUM_COPIES        = int(os.environ.get('NUM_COPIES', '3'))
-INTERLEAVE_DEPTH  = int(os.environ.get('INTERLEAVE_DEPTH', '3'))
+
+# Loss recovery / bandwidth knobs.
+#   KEYFRAME_INTERVAL — seconds between full tag-table refreshes. This is
+#     the recovery bound: a lost delta is corrected within this window.
+#   CHANGE_DEADBAND   — fractional change required to send a tag between
+#     keyframes. 0.0 = send on ANY difference (lossless, but analog signals
+#     then move nearly every poll). 0.01 = 1% deadband (historian-style
+#     compression — big bandwidth win, small fidelity trade-off).
+#   HEARTBEAT_COPIES  — duplicate count for the heartbeat frame only.
+KEYFRAME_INTERVAL = float(os.environ.get('KEYFRAME_INTERVAL', '5.0'))
+CHANGE_DEADBAND   = float(os.environ.get('CHANGE_DEADBAND', '0.0'))
+HEARTBEAT_COPIES  = int(os.environ.get('HEARTBEAT_COPIES', '3'))
 
 # Modbus adapter config
 MODBUS_HOST       = os.environ.get('MODBUS_HOST', 'plc-modbus')
@@ -106,44 +117,39 @@ def poll_http_json() -> list[dict]:
     return readings
 
 
-# ── Interleave Buffer ─────────────────────────────────────────
-class InterleaveBuffer:
+# ── Send-on-change tracking ──────────────────────────────────
+def send_batch(sock, dest, seq: int, timestamp: int, records: list,
+               keyframe: bool = False) -> int:
     """
-    Manages interleaving of frame copies across multiple lanes.
-
-    For multi-sensor poll cycles (which is our case — Modbus reads 15 at once),
-    this naturally spaces copies of the same frame apart by num_sensors positions.
-    See dequeue() docstring for details.
+    Send `records` as one or more MTU-safe batch datagrams, splitting when
+    the record count exceeds MAX_RECORDS_PER_DATAGRAM so no datagram ever
+    IP-fragments. Each chunk is a self-contained batch with its own SEQ
+    (a split keyframe is still N keyframes — the IT side converges once it
+    has seen all chunks). Returns the next free SEQ.
     """
+    cap = MAX_RECORDS_PER_DATAGRAM
+    for i in range(0, len(records), cap):
+        chunk = records[i:i + cap]
+        frame = build_batch(seq, timestamp, chunk, keyframe=keyframe)
+        sock.sendto(frame, dest)
+        seq += 1
+    return seq
 
-    def __init__(self, num_copies: int, depth: int):
-        self.num_copies = num_copies
-        self.depth = depth
-        self.lanes = [collections.deque() for _ in range(num_copies)]
 
-    def enqueue(self, seq: int, payload: bytes):
-        for i in range(self.num_copies):
-            ttl = self.num_copies - i
-            frame = build_frame(seq, ttl, payload)
-            self.lanes[i].append(frame)
-
-    def dequeue(self) -> bytes | None:
-        """
-        Drain lane-by-lane. With N sensors enqueued per cycle:
-          lane[0] has [F0.a, F1.a, F2.a ... FN.a]
-          lane[1] has [F0.b, F1.b, F2.b ... FN.b]
-          lane[2] has [F0.c, F1.c, F2.c ... FN.c]
-
-        Output: F0.a F1.a F2.a ... FN.a | F0.b F1.b ... FN.b | F0.c F1.c ... FN.c
-        Result: copies of the same SEQ are N positions apart in time.
-        """
-        for lane in self.lanes:
-            if lane:
-                return lane.popleft()
-        return None
-
-    def pending(self) -> int:
-        return sum(len(lane) for lane in self.lanes)
+def has_changed(tag_id: int, value: float, quality: int,
+                last_sent: dict, deadband: float) -> bool:
+    """
+    Decide whether a reading is worth sending between keyframes.
+    Sends if the tag is new, its quality changed, or its value moved
+    past the (fractional) deadband relative to what we last transmitted.
+    """
+    if tag_id not in last_sent:
+        return True
+    prev_value, prev_quality = last_sent[tag_id]
+    if quality != prev_quality:
+        return True
+    denom = max(abs(prev_value), 1e-6)
+    return abs(value - prev_value) / denom > deadband
 
 
 # ── Adapter Factory ──────────────────────────────────────────
@@ -174,22 +180,22 @@ def create_adapter():
 # ── Main Loop ─────────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  OT-SIDE PROXY — Multi-Adapter Data Diode Sender")
+    print("  OT-SIDE PROXY — Batched / Keyframe-Refresh Diode Sender")
     print("=" * 60)
-    print(f"  Adapter:     {ADAPTER_TYPE}")
-    print(f"  Sending to:  {FPGA_HOST}:{FPGA_PORT} (UDP)")
-    print(f"  Copies:      {NUM_COPIES}x")
-    print(f"  Interval:    {POLL_INTERVAL}s")
+    print(f"  Adapter:      {ADAPTER_TYPE}")
+    print(f"  Sending to:   {FPGA_HOST}:{FPGA_PORT} (UDP)")
+    print(f"  Poll:         {POLL_INTERVAL}s")
+    print(f"  Keyframe:     every {KEYFRAME_INTERVAL}s (full refresh)")
+    print(f"  Deadband:     {CHANGE_DEADBAND * 100:.2f}% (send-on-change)")
+    print(f"  HB copies:    {HEARTBEAT_COPIES}x")
     print("=" * 60)
 
-    # Build the adapter
     adapter = create_adapter()
 
     # Wait for adapter to be ready
     print("[INIT] Waiting for sensor source to come up...")
     while True:
         if adapter is None:
-            # HTTP adapter — try a request
             try:
                 urllib.request.urlopen(SENSOR_POLL_URL, timeout=2.0)
                 print("[INIT] HTTP source is up!")
@@ -197,22 +203,19 @@ def main():
             except Exception:
                 time.sleep(2)
         else:
-            # Modbus adapter — try to connect
             if adapter.connect():
-                print("[INIT] Modbus PLC is up!")
+                print("[INIT] PLC is up!")
                 break
             time.sleep(2)
 
     # UDP socket — send only
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    buffer = InterleaveBuffer(NUM_COPIES, INTERLEAVE_DEPTH)
     seq = 0
-    total_readings = 0
-
-    # Heartbeat state — uptime starts now, in monotonic seconds.
-    # We use monotonic so NTP adjustments / system clock changes don't
-    # mess up the heartbeat's "I've been running this long" value.
+    total_readings_sent = 0
+    last_sent = {}                       # tag_id -> (value, quality)
+    # Force a keyframe on the very first poll.
+    last_keyframe_monotonic = None
     start_time_monotonic = time.monotonic()
 
     while True:
@@ -222,59 +225,62 @@ def main():
         else:
             readings = adapter.poll()
 
-        # ── Step 1b: Generate heartbeat ───────────────────────
-        # Sent EVERY cycle, regardless of whether sensors responded.
-        # Quality reflects whether the adapter is healthy:
-        #   - GOOD if we got sensor readings this cycle
-        #   - COMM_FAIL if poll returned nothing or all were COMM_FAIL
-        # IT side can use this to distinguish "OT alive but PLC down"
-        # from "OT proxy dead entirely" (no heartbeat at all).
-        uptime_s = time.monotonic() - start_time_monotonic
+        now_mono = time.monotonic()
+        timestamp = int(time.time())
+
+        # ── Step 2: Keyframe vs delta selection ───────────────
+        is_keyframe = (last_keyframe_monotonic is None or
+                       (now_mono - last_keyframe_monotonic) >= KEYFRAME_INTERVAL)
+
+        if is_keyframe:
+            selected = list(readings)
+            last_keyframe_monotonic = now_mono
+        else:
+            selected = [
+                r for r in readings
+                if has_changed(r['tag_id'], r['value'], r['quality'],
+                               last_sent, CHANGE_DEADBAND)
+            ]
+
+        # ── Step 3: Batch + send sensor data (split if > 1 MTU) ─
+        sent_kind = None
+        if selected:
+            records = [(r['tag_id'], r['value'], r['quality']) for r in selected]
+            start_seq = seq
+            seq = send_batch(sock, (FPGA_HOST, FPGA_PORT), seq, timestamp,
+                             records, keyframe=is_keyframe)
+            for r in selected:
+                last_sent[r['tag_id']] = (r['value'], r['quality'])
+            total_readings_sent += len(selected)
+            sent_kind = 'KEYFRAME' if is_keyframe else 'delta'
+            n_datagrams = seq - start_seq
+
+        # ── Step 4: Heartbeat (own frame, duplicated) ─────────
+        uptime_s = now_mono - start_time_monotonic
         adapter_healthy = bool(readings) and any(
             r.get('quality', QUALITY_COMM_FAIL) == QUALITY_GOOD
             for r in readings
         )
-        heartbeat = {
-            'timestamp': int(time.time()),
-            'tag_id':    HEARTBEAT_TAG_ID,
-            'value':     float(uptime_s),
-            'quality':   QUALITY_GOOD if adapter_healthy else QUALITY_COMM_FAIL,
-            'name':      '__heartbeat__',
-        }
-        # Append after sensor readings so heartbeat goes through
-        # the same frame builder + interleave + 3-copy path as data.
-        readings = list(readings) + [heartbeat]
+        hb_quality = QUALITY_GOOD if adapter_healthy else QUALITY_COMM_FAIL
+        hb_records = [(HEARTBEAT_TAG_ID, float(uptime_s), hb_quality)]
+        hb_frame = build_batch(seq, timestamp, hb_records, heartbeat=True)
+        for _ in range(HEARTBEAT_COPIES):
+            sock.sendto(hb_frame, (FPGA_HOST, FPGA_PORT))
+            time.sleep(0.005)   # small wire-time gap between copies
+        seq += 1
 
-        # ── Step 2-4: Pack, Frame, Copy ───────────────────────
-        for reading in readings:
-            payload = pack_sensor_struct(
-                reading['timestamp'],
-                reading['tag_id'],
-                reading['value'],
-                reading['quality'],
-            )
-            buffer.enqueue(seq, payload)
-            seq += 1
-
-        # ── Step 5-6: Interleave and Send ─────────────────────
-        sent_count = 0
-        while buffer.pending() > 0:
-            frame = buffer.dequeue()
-            if frame:
-                sock.sendto(frame, (FPGA_HOST, FPGA_PORT))
-                sent_count += 1
-                time.sleep(0.01)   # small wire-time gap
-
-        if readings:
-            total_readings += len(readings)
-            # Pull names from the first few readings for a useful summary
+        # ── Log ───────────────────────────────────────────────
+        if sent_kind:
             sample = ", ".join(
-                f"{r.get('name','?')}={r['value']:.1f}"
-                for r in readings[:3]
+                f"{r.get('name', '?')}={r['value']:.1f}"
+                for r in selected[:3]
             )
-            print(f"[TX] SEQ {seq - len(readings)}-{seq - 1} | "
-                  f"{len(readings)} readings | {sent_count} frames sent | "
-                  f"sample: {sample}")
+            span = (f"seq={start_seq}" if n_datagrams == 1
+                    else f"seq={start_seq}..{seq - 1} ({n_datagrams} datagrams)")
+            print(f"[TX] {span} | {sent_kind:<8s} | "
+                  f"{len(selected)} readings | sample: {sample}")
+        else:
+            print(f"[TX] no change this poll (heartbeat only)")
 
         time.sleep(POLL_INTERVAL)
 
